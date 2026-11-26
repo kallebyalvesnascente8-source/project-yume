@@ -1,0 +1,19 @@
+{
+  "expo": {
+    "name": "yume",
+    "slug": "yume",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#050505",
+    "icon": "./assets/icon.png",
+    "android": {
+      "package": "com.lebin.yume",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#050505"
+      }
+    }
+  }
+}
