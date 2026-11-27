@@ -1,0 +1,136 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Versão (exemplo: 0.1.0)"
+        required: true
+        default: "0.1.0"
+      prerelease:
+        description: "Marcar como pré-lançamento"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v4
+
+      - name: Validar a versão
+        run: |
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Versão inválida: use o formato 1.2.3"
+            exit 1
+          fi
+
+      - name: Instalar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Instalar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Instalar dependências
+        run: npm install --no-audit --no-fund
+
+      - name: Definir versão e código de versão
+        run: |
+          node -e "
+            const fs = require('fs');
+            const app = JSON.parse(fs.readFileSync('app.json', 'utf8'));
+            app.expo.version = process.env.VERSION;
+            app.expo.android.versionCode = Number(process.env.GITHUB_RUN_NUMBER);
+            fs.writeFileSync('app.json', JSON.stringify(app, null, 2));
+            console.log('versão', app.expo.version, 'versionCode', app.expo.android.versionCode);
+          "
+
+      - name: Gerar o projeto Android
+        run: npx expo prebuild --platform android --no-install --clean
+
+      - name: Compilar APK arm64
+        working-directory: android
+        run: ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a --no-daemon
+      - name: Guardar APK arm64
+        run: |
+          mkdir -p out
+          cp android/app/build/outputs/apk/release/app-release.apk out/unsigned-arm64.apk
+
+      - name: Compilar APK universal
+        working-directory: android
+        run: ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a,x86,x86_64 --no-daemon
+      - name: Guardar APK universal
+        run: cp android/app/build/outputs/apk/release/app-release.apk out/unsigned-universal.apk
+
+      - name: Assinar os APKs
+        env:
+          KS_B64: ${{ secrets.YUME_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.YUME_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.YUME_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.YUME_KEY_PASSWORD }}
+        run: |
+          set -e
+          if [ -z "$KS_B64" ] || [ -z "$KS_PASS" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASS" ]; then
+            echo "Faltam Secrets de assinatura. Confira a aba Settings, Secrets and variables, Actions."
+            exit 1
+          fi
+          KS_FILE="$RUNNER_TEMP/yume-release.keystore"
+          echo "$KS_B64" | base64 -d > "$KS_FILE"
+          BT_DIR="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          export KS_PASS KEY_PASS
+          for kind in arm64 universal; do
+            "$BT_DIR/apksigner" sign \
+              --ks "$KS_FILE" \
+              --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass env:KS_PASS \
+              --key-pass env:KEY_PASS \
+              --v2-signing-enabled true \
+              --out "out/yume-${VERSION}-${kind}.apk" \
+              "out/unsigned-${kind}.apk"
+            "$BT_DIR/apksigner" verify --print-certs "out/yume-${VERSION}-${kind}.apk" | grep -E "SHA-256|Verified"
+          done
+          rm -f "$KS_FILE" out/unsigned-*.apk
+
+      - name: Gerar SHA-256
+        run: |
+          cd out
+          sha256sum yume-*.apk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Preparar notas da versão
+        run: |
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" {found=1; next}
+            found && /^## \[/ {exit}
+            found {print}
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then echo "Versão $VERSION." > notes.md; fi
+          cat notes.md
+
+      - name: Publicar o Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRE: ${{ inputs.prerelease }}
+        run: |
+          FLAGS=""
+          if [ "$PRE" = "true" ]; then FLAGS="--prerelease"; fi
+          gh release create "v${VERSION}" out/yume-*.apk out/SHA256SUMS.txt \
+            --title "yume ${VERSION}" \
+            --notes-file notes.md \
+            $FLAGS
